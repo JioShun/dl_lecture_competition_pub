@@ -49,7 +49,6 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
 def compute_multi_scale_loss(pred_flows: List[torch.Tensor], gt_flow: torch.Tensor, criterion) -> torch.Tensor:
     total_loss = 0.0
     for i, pred_flow in enumerate(pred_flows):
-        # グラウンドトゥルースを対応するスケールにダウンサンプル
         if pred_flow.dim() == 4:
             _, _, h, w = pred_flow.size()
         elif pred_flow.dim() == 3:
@@ -58,7 +57,6 @@ def compute_multi_scale_loss(pred_flows: List[torch.Tensor], gt_flow: torch.Tens
             raise ValueError(f"Unexpected pred_flow dimensions: {pred_flow.dim()}")
         
         scaled_gt_flow = F.interpolate(gt_flow, size=(h, w), mode='bilinear', align_corners=False)
-        # ロスの計算
         loss = criterion(pred_flow, scaled_gt_flow)
         total_loss += loss
     return total_loss
@@ -136,10 +134,7 @@ def main(args: DictConfig):
     #   optimizer
     # ------------------
     optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
-    # ------------------
-    #   Start training
-    # ------------------
-    
+
     # 学習率スケジューラの設定
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_data), epochs=args.train.epochs)
     
@@ -169,7 +164,6 @@ def main(args: DictConfig):
             event_image = batch["event_volume"].to(device)  # [B, 4, 480, 640]
             ground_truth_flow = batch["flow_gt"].to(device)  # [B, 2, 480, 640]
             
-            # モデルのフォワードパス
             pred_flows = model(event_image)
             
             # 多スケールロスの計算
@@ -180,16 +174,13 @@ def main(args: DictConfig):
             loss.backward()
             optimizer.step()
             
-            # 学習率スケジューラにエポックごとのロスを渡して調整
             scheduler.step()
 
             total_loss += loss.item()
             
-        # エポックごとのロスの平均を計算
         epoch_loss = total_loss / len(train_data)
         print(f'Epoch {epoch + 1}, Loss: {epoch_loss}')
         
-        # 現在の学習率を表示
         current_lr = scheduler.optimizer.param_groups[0]['lr']
         print(f"Learning rate after epoch {epoch + 1}: {current_lr}")
 
