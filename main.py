@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import hydra
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
@@ -10,9 +11,10 @@ from enum import Enum, auto
 from src.datasets import train_collate
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 import os
 import time
+
 
 
 class RepresentationType(Enum):
@@ -43,6 +45,24 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     file_name: str => ファイル名
     '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
+    
+def compute_multi_scale_loss(pred_flows: List[torch.Tensor], gt_flow: torch.Tensor, criterion) -> torch.Tensor:
+    total_loss = 0.0
+    for i, pred_flow in enumerate(pred_flows):
+        # グラウンドトゥルースを対応するスケールにダウンサンプル
+        if pred_flow.dim() == 4:
+            _, _, h, w = pred_flow.size()
+        elif pred_flow.dim() == 3:
+            _, h, w = pred_flow.size()
+        else:
+            raise ValueError(f"Unexpected pred_flow dimensions: {pred_flow.dim()}")
+        
+        scaled_gt_flow = F.interpolate(gt_flow, size=(h, w), mode='bilinear', align_corners=False)
+        # ロスの計算
+        loss = criterion(pred_flow, scaled_gt_flow)
+        total_loss += loss
+    return total_loss
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
@@ -119,23 +139,59 @@ def main(args: DictConfig):
     # ------------------
     #   Start training
     # ------------------
+    
+    # 学習率スケジューラの設定
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.01, steps_per_epoch=len(train_data), epochs=args.train.epochs)
+    
+    criterion = compute_epe_error
+
     model.train()
     for epoch in range(args.train.epochs):
         total_loss = 0
         print("on epoch: {}".format(epoch+1))
+        # for i, batch in enumerate(tqdm(train_data)):
+        #     batch: Dict[str, Any]
+        #     event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
+        #     ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
+        #     flow = model(event_image) # [B, 2, 480, 640]
+            
+        #     loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+        #     print(f"batch {i} loss: {loss.item()}")
+        #     optimizer.zero_grad()
+        #     loss.backward()
+        #     optimizer.step()
+
+        #     total_loss += loss.item()
+        # print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+        
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
-            ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            event_image = batch["event_volume"].to(device)  # [B, 4, 480, 640]
+            ground_truth_flow = batch["flow_gt"].to(device)  # [B, 2, 480, 640]
+            
+            # モデルのフォワードパス
+            pred_flows = model(event_image)
+            
+            # 多スケールロスの計算
+            loss = compute_multi_scale_loss(pred_flows, ground_truth_flow, criterion)
+            
             print(f"batch {i} loss: {loss.item()}")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
+            # 学習率スケジューラにエポックごとのロスを渡して調整
+            scheduler.step()
 
             total_loss += loss.item()
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+            
+        # エポックごとのロスの平均を計算
+        epoch_loss = total_loss / len(train_data)
+        print(f'Epoch {epoch + 1}, Loss: {epoch_loss}')
+        
+        # 現在の学習率を表示
+        current_lr = scheduler.optimizer.param_groups[0]['lr']
+        print(f"Learning rate after epoch {epoch + 1}: {current_lr}")
 
     # Create the directory if it doesn't exist
     if not os.path.exists('checkpoints'):
